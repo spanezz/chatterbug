@@ -1,0 +1,194 @@
+#!/usr/bin/python3
+import argparse
+import logging
+import sys
+import glob
+import contextlib
+import termios
+import statistics
+import texttable
+import re
+import libinput
+
+
+log = logging.getLogger()
+
+
+re_keycode = re.compile(r"^#define KEY_(?P<name>\w+)\s+(?P<code>\d+)")
+
+
+class Fail(Exception):
+    pass
+
+
+def load_keycodes():
+    keymap = {}
+    with open("/usr/include/linux/input-event-codes.h", "rt") as fd:
+        for line in fd:
+            mo = re_keycode.match(line)
+            if mo:
+                keymap[int(mo.group("code"))] = mo.group("name")
+    return keymap
+
+
+@contextlib.contextmanager
+def noecho():
+    fd = sys.stdin.fileno()
+
+    # from getpass source
+    old = termios.tcgetattr(fd)     # a copy to save
+    new = old[:]
+    new[3] &= ~termios.ECHO  # 3 == 'lflags'
+    tcsetattr_flags = termios.TCSAFLUSH
+    if hasattr(termios, 'TCSASOFT'):
+        tcsetattr_flags |= termios.TCSASOFT
+    try:
+        termios.tcsetattr(fd, tcsetattr_flags, new)
+        yield
+    finally:
+        termios.tcsetattr(fd, tcsetattr_flags, old)
+
+
+def list_devices(context):
+    for fn in glob.glob("/dev/input/event*"):
+        device = context.add_device(fn)
+        if device is None:
+            print(fn, None)
+            continue
+        print(fn, device.name)
+        context.remove_device(device)
+
+
+class Delays(list):
+    def stats(self):
+        dataset = [x for x in self if x < 1000000]
+        if len(dataset) < 2:
+            return 0, 0, 0, 0
+        mean = statistics.mean(dataset)
+        return len(dataset), mean, min(dataset), statistics.stdev(dataset, mean)
+
+
+class KeyStats:
+    def __init__(self, key):
+        self.key = key
+        self.last_state = None
+        self.last_press_time = None
+        self.last_release_time = None
+        self.press_release_delays = Delays()
+        self.release_press_delays = Delays()
+        self.press_press_delays = Delays()
+        self.release_release_delays = Delays()
+
+    def notify(self, time, state):
+        if state == libinput.constant.KeyState.RELEASED:
+            self.notify_press(time)
+        elif state == libinput.constant.KeyState.PRESSED:
+            self.notify_release(time)
+        else:
+            log.warning("%s: unknown keyboard state %s", self.key, state)
+
+        if self.last_state is not None:
+            if state == self.last_state:
+                log.info("%s: duplicate state %d", self.key, state)
+        self.last_state = state
+
+        pr_count, pr_mean, pr_min, pr_stdev = self.press_release_delays.stats()
+        pp_count, pp_mean, pp_min, pp_stdev = self.press_press_delays.stats()
+        rp_count, rp_mean, rp_min, rp_stdev = self.release_press_delays.stats()
+        rr_count, rr_mean, rr_min, rr_stdev = self.release_release_delays.stats()
+        log.info("%s: pr %d,%d,%d,%d pp %d,%d,%d,%d rp %d,%d,%d,%d rr %d,%d,%d,%d",
+                 self.key,
+                 pr_count, pr_mean, pr_min, pr_stdev,
+                 pp_count, pp_mean, pp_min, pp_stdev,
+                 rp_count, rp_mean, rp_min, rp_stdev,
+                 rr_count, rr_mean, rr_min, rr_stdev)
+
+    def notify_press(self, time):
+        if self.last_press_time is not None:
+            self.press_press_delays.append(time - self.last_press_time)
+        if self.last_release_time is not None:
+            self.release_press_delays.append(time - self.last_release_time)
+        self.last_press_time = time
+
+    def notify_release(self, time):
+        if self.last_press_time is not None:
+            self.press_release_delays.append(time - self.last_press_time)
+        if self.last_release_time is not None:
+            self.release_release_delays.append(time - self.last_release_time)
+        self.last_release_time = time
+
+
+class Stats:
+    def __init__(self, context):
+        self.context = context
+        self.by_key = {}
+        self.keycodes = load_keycodes()
+
+    def collect(self):
+        for event in self.context.events:
+            if event.type != libinput.constant.EventType.KEYBOARD_KEY:
+                print("Ignoring", event.type)
+                continue
+            stats = self.by_key.get(event.key)
+            if stats is None:
+                stats = KeyStats(event.key)
+                self.by_key[event.key] = stats
+            stats.notify(event.time, event.key_state)
+
+    def aggregate(self):
+        pp_stats = []
+        for key, stats in self.by_key.items():
+            count, mean, tmin, stdev = stats.press_press_delays.stats()
+            if mean == 0:
+                continue
+            pp_stats.append((key, self.keycodes.get(key, "--"), count, mean, tmin, stdev))
+        pp_stats.sort(key=lambda x: x[5])
+        table = texttable.Texttable()
+        headers = ("Key", "Desc", "Count", "Mean", "Min", "Stdev")
+        table.set_deco(texttable.Texttable.HEADER)
+        table.set_cols_align(["r", "l", "r", "r", "r", "r"])
+        table.add_rows([headers] + pp_stats)
+        print(table.draw())
+
+
+def main():
+    parser = argparse.ArgumentParser(description="monitor and manage fuss-server and its network of clients")
+    parser.add_argument("--verbose", "-v", action="store_true", help="verbose output")
+    parser.add_argument("--debug", action="store_true", help="debug output")
+    parser.add_argument("device", action="store", nargs="?", help="device to use")
+
+    args = parser.parse_args()
+
+    # Setup logging
+    FORMAT = "%(asctime)-15s %(levelname)s %(message)s"
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr, format=FORMAT)
+    elif args.verbose:
+        logging.basicConfig(level=logging.INFO, stream=sys.stderr, format=FORMAT)
+    else:
+        logging.basicConfig(level=logging.WARN, stream=sys.stderr, format=FORMAT)
+
+    context = libinput.LibInput(context_type=libinput.ContextType.PATH)
+    if not args.device:
+        list_devices(context)
+        return
+
+    context.add_device(args.device)
+
+    stats = Stats(context)
+    with noecho():
+        try:
+            stats.collect()
+        except KeyboardInterrupt:
+            pass
+    stats.aggregate()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Fail as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        log.exception("uncaught exception: {}".format(str(e)))
